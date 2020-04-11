@@ -14,9 +14,9 @@ import datetime
 
 #tensorflow inputs
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.optimizers import Adam
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.optimizers import Adam
 
 env_name = "CartPole-v1"
 
@@ -37,7 +37,7 @@ class DQNSolver:
         self.memory = deque(maxlen=self.MEMORY_SIZE)
         
         #writer for tensorboard
-        self.summary_writer = tf.summary.FileWriter(log_dir)
+        self.summary_writer = tf.summary.create_file_writer(log_dir)
         
         #NN parameters
         #1 hidden layer NN      
@@ -90,7 +90,8 @@ class DQNSolver:
             #update q_vals with new q_vals from specific actions taken
             q_vals[0][action] = q_update
             #fit the model
-            self.model.fit(state, q_vals, verbose=0)
+            #self.model.fit(state, q_vals, verbose=0)
+            self.model.train_on_batch(state, q_vals)
             
             #decrease the exploration
             self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
@@ -100,13 +101,10 @@ class DQNSolver:
     
     def log_results(self, name, val, idx):
         #log results for visualization in Tensorboard
-        summary = tf.summary.Summary()
-        summary_value = summary.value.add()
-        summary_value.simple_value = val
-        summary_value.tag = name
-        self.summary_writer.add_summary(summary, idx)
-        self.summary_writer.flush()
-            
+        with self.summary_writer.as_default():
+            tf.summary.scalar(name, val, step=idx)
+            self.summary_writer.flush()
+     
 ###############################################################################
     
 def plot_results(results, mean_results, episode, num_ticks_to_win):
@@ -125,6 +123,9 @@ def cartpole(num_episodes, epsilon_decay, log_dir, verbose = True, make_plots = 
     
     if verbose:
         print("Solving CartPole with DQN using Keras and TensorFlow")
+    
+    #print version of tensorflow
+    print("Tensorflow version: ", tf.__version__)
     
     scores = deque(maxlen=100)
     score_list = []
