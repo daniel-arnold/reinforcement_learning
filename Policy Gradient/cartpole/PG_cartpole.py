@@ -36,12 +36,8 @@ class ProbDistribution(tf.keras.Model):
 class Model(tf.keras.Model):
     def __init__(self, action_space):
         super().__init__('mlp_policy')
-        # we'll use one network with multiple outputs for actor and critic
-        #hidden layers for AC
         self.hidden1 = kl.Dense(128, activation='relu')
-        self.hidden2 = kl.Dense(128, activation='relu')
         #output layers
-        self.value = kl.Dense(1, name="value")
         self.logits = kl.Dense(action_space, name='policy_logits')
         self.dist = ProbDistribution()
         
@@ -49,15 +45,14 @@ class Model(tf.keras.Model):
         #inputs are numpy array, that we convert to a tensor
         x = tf.convert_to_tensor(inputs)
         hidden_logits = self.hidden1(x)
-        hidden_value = self.hidden2(x)
-        return self.logits(hidden_logits), self.value(hidden_value)
+        return self.logits(hidden_logits)
     
-    def get_action_value(self, obs):
+    def get_action(self, obs):
         #compute logits and value
-        logits, value = self.predict_on_batch(obs)
+        logits = self.predict_on_batch(obs)
         #compute actions
         action = self.dist.predict_on_batch(logits)
-        return np.squeeze(action, axis=-1), np.squeeze(value, axis=-1)
+        return np.squeeze(action, axis=-1)
 
 #####################################
 ############## Agent ################
@@ -73,16 +68,16 @@ class A2CAgent:
         self.model = model
         self.model.compile(
             optimizer=ko.Adam(lr=self.lr),
-            loss=[self._logits_loss, self._value_loss])
+            loss=self._logits_loss)
 
 
-    def train(self, env, batch_sz=64, updates=250):
+    def train(self, env, batch_sz=64, updates=300):
         #need to account for the fact that the batch size may 
         #cross episodes
         
         #storage helpers for single batch of data
         actions = np.empty((batch_sz,), dtype=np.int32)
-        rewards, dones, values = np.empty((3, batch_sz))
+        rewards, dones = np.empty((2, batch_sz))
         observations = np.empty((batch_sz,)  + env.observation_space.shape)
         #training loop
         ep_rewards = [0.0]
@@ -91,7 +86,7 @@ class A2CAgent:
             for step in range(batch_sz):
                 observations[step] = next_obs.copy()
                 #get the action and value for this state
-                actions[step], values[step] = self.model.get_action_value(next_obs[None, :])
+                actions[step] = self.model.get_action(next_obs[None, :])
                 #advance the environment
                 next_obs, rewards[step], dones[step], _ = env.step(actions[step])
                 
@@ -102,13 +97,12 @@ class A2CAgent:
                     logging.info("Episode: %03d, Reward: %03d" % (len(ep_rewards)-1, ep_rewards[-2]))
             
             #if episode isn't done, will need V(s_tp1) for advantage
-            _, next_value = self.model.get_action_value(next_obs[None, :])
-            returns, advs = self._returns_advantages(rewards, dones, values, next_value)
+            returns, advs = self._returns_advantages(rewards, dones)
             #trick to input actions and advantages into same API
             acts_and_advs = np.concatenate([actions[:, None], advs[:, None]], axis=-1)
-            #acts_and_advs = np.concatenate([actions[None, :], advs[None, :]], axis=-1)
             #train with the batch
-            losses = self.model.train_on_batch(observations, [acts_and_advs, returns])
+            #losses = self.model.train_on_batch(observations, [acts_and_advs, returns])
+            losses = self.model.train_on_batch(observations, acts_and_advs)
             logging.debug("[%d/%d] Losses: %s" % (update + 1, updates, losses))
             
         return ep_rewards
@@ -116,27 +110,23 @@ class A2CAgent:
     def test(self, env, render=False):
         state, done, episode_reward = env.reset(), False, 0
         while not done:
-            action, _ = self.model.get_action_value(state[None, :])
+            action = self.model.get_action(state[None, :])
             state, reward, done, _ = env.step(action)
             episode_reward += reward
             if render:
                 env.render()
         return episode_reward
     
-    def _returns_advantages(self, rewards, dones, values, next_value):
-        returns = np.append(np.zeros_like(rewards), next_value, axis=-1)
-        #Rt = rt + gamma * V(s_t+1)
+    def _returns_advantages(self, rewards, dones):
+        returns = rewards.copy()
         #super clever way to do this...
-        for t in reversed(range(rewards.shape[0])):
+        for t in reversed(range(rewards.shape[0] - 1)):
             returns[t] = rewards[t] + self.gamma * returns[t+1] * (1 - dones[t])
-        returns = returns[:-1]
-        #compute advantages = returns - V
-        advantages = returns - values
-        return returns, advantages
-    
-    def _value_loss(self, returns, values):
-        #minimize mse between estimates and returns
-        return self.value_c * kls.mean_squared_error(returns, values)
+        #compute advantages = returns - baseline
+        baseline = np.mean(returns) * np.ones_like(returns)
+        disc_returns = (returns - baseline)
+        advantages = disc_returns / np.std(disc_returns)
+        return disc_returns, advantages
     
     def _logits_loss(self, actions_and_advantages, logits):
         actions, advantages = tf.split(actions_and_advantages, 2, axis=-1)
