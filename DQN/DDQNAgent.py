@@ -12,27 +12,27 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.initializers import he_normal
-from tensorflow.keras.losses import Huber
-from collections import deque
 import random
+from collections import deque
 
 #####################################
 ########## Memory Buffer ############
 #####################################
 
 class ExperienceReplay:
-    def __init__(self, maxlen):
-        self._buffer = deque(maxlen=maxlen)
+    def __init__(self, buffer_len):
+        
+        self.buffer = deque(maxlen=buffer_len)
         
     def store(self, state, action, reward, next_state, done):
-        self._buffer.append((state, action, reward, next_state, done))
+        self.buffer.append((state, action, reward, next_state, done))
         
-    def get_batch(self, batch_size):
-        sample_num = len(self._buffer)
-        if(sample_num >  batch_size):
-            return random.sample(self._buffer, sample_num)
+    def get_batch(self, memory_batch_size):
+        sample_num = len(self.buffer)
+        if(sample_num <  memory_batch_size):
+            return random.sample(self.buffer, sample_num)
         else:
-            return random.sample(self._buffer, batch_size)
+            return random.sample(self.buffer, memory_batch_size)
         
     def get_arrays_from_batch(self, batch, num_states):
         states = np.array([x[0] for x in batch])
@@ -43,9 +43,8 @@ class ExperienceReplay:
         dones = np.array([x[4] for x in batch])
         return states, actions, rewards, next_states, dones
    
-    @property
     def buffer_size(self):
-        return len(self._buffer)
+        return len(self.buffer)
 
 #####################################
 ############## Agent ################
@@ -57,32 +56,29 @@ class DDQNAgent:
         self.nn_params = nn_params
 
         self.epsilon_decay = hyp_params['epsilon_decay']
-        self.epsilon_max = 1.0
+        self.epsilon_max = hyp_params['epsilon_initial']
         self.epsilon = self.epsilon_max
         self.epsilon_min = 0.01
         self.lr = hyp_params['lr']
+        self.lr_decay_start = hyp_params['lr_decay_start']
+        self.lr_decay_rate = hyp_params['lr_decay_rate']
         self.gamma = hyp_params['gamma']
         self.tau = hyp_params['tau']
-        self.clipnorm_val = hyp_params['clipnorm_val']
         self.batch_size = hyp_params['batch_size']       
-        self.memory_size = hyp_params['memory_size']
+        self.memory_size = hyp_params['buffer_size']
+        self.start_learning = hyp_params['start_learning']
         self.action_space = action_space
         self.observation_space = observation_space
         self.er = ExperienceReplay(self.memory_size)
         
+        self.num_updates = 0 #number of training iterations
+        
         logging.getLogger().setLevel(logging.INFO)
         
         self.Q_prime = self._build_network()
-        if(self.clipnorm_val <= 0):
-            self.Q_prime.compile(loss=Huber(), 
-                                 optimizer=Adam(lr=self.lr))
-        else:
-            self.Q_prime.compile(loss=Huber(), 
-                                 optimizer=Adam(lr=self.lr, 
-                                                clipnorm=self.clipnorm_val))
-        
         self.Q_target = self._build_network()
         self.Q_target.set_weights(self.Q_prime.get_weights())
+        self.q_optimizer = Adam(lr=self.lr)
         
     def _build_network(self):
         inputs = Input(shape=(self.observation_space, ), name='state')
@@ -91,6 +87,7 @@ class DDQNAgent:
             x = Dense(self.nn_params['hidden_neurons'][i], 
                       activation=self.nn_params['activations'][i],
                       kernel_initializer=he_normal())(x)
+            #x = BatchNormalization()(x)
         outputs = Dense(self.action_space, activation='linear')(x)
         net = Model(inputs, outputs)
         return net
@@ -125,72 +122,107 @@ class DDQNAgent:
         #choose best action and return
         return np.argmax(q_vals)
     
+    def update_learning_rate(self):
+        if(self.num_updates >= self.lr_decay_start):
+            self.lr = self.lr_decay_rate * self.lr
+            self.q_optimizer = Adam(lr=self.lr)
+            
+    def update_epsilon(self):
+        self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
+    
     def train_network(self):
-        if self.er.buffer_size < self.batch_size:
+        
+        if self.er.buffer_size() < self.batch_size:
             return 0
         #get a batch from the memory buffer
         batch = self.er.get_batch(self.batch_size)
         states, actions, rewards, next_states, dones = \
             self.er.get_arrays_from_batch(batch, self.observation_space)
-            
-        #predict Q(s,a) and Q(s',a') of primary network
-        q_vals = (self.Q_prime.predict_on_batch(states)).numpy()
-        q_vals_next_state = self.Q_prime.predict_on_batch(next_states)
-        #find the optimal actions for Q(s',a')
-        actions_optimal = np.argmax(q_vals_next_state, axis=1)
         
-        batch_idxs = np.arange(self.er.buffer_size)  
-        #predict Q(s',a') for target network
-        q_next_state_target = self.Q_target.predict_on_batch(next_states)
-        #compute the update using Q_target with Q_primary optimal actions
-
-        q_next_state_target = q_next_state_target.numpy()
-        q_update = rewards + \
-            self.gamma * q_next_state_target[batch_idxs, actions_optimal] * (1 - dones)
-         
-        #update q_vals for training and train
-        q_vals[batch_idxs,actions] = q_update
-        loss = self.Q_prime.train_on_batch(states, q_vals)
+        #create indices needed for slicing
+        batch_idxs = np.arange(len(batch))
+        #cast as a int32 tensor and reshape
+        batch_idxs = tf.cast(batch_idxs, tf.int32)
+        batch_idxs = tf.reshape(batch_idxs,[len(batch_idxs),1])
+        #cast actions as int32 tensor and reshape
+        actions = tf.cast(actions, tf.int32)
+        actions = tf.reshape(actions,[len(actions),1])
+        
+        #perform the update
+        with tf.GradientTape() as tape:
+            #get q_vals from primary network for s'
+            q_vals_next_state = self.Q_prime(next_states)
+            #compute optimal actions from Q(s',a)
+            actions_optimal = tf.cast(tf.math.argmax(q_vals_next_state, axis=1), tf.int32)
+            actions_optimal = tf.reshape(actions_optimal,[len(actions_optimal),1])
+            
+            #predict target Q values for s'
+            q_next_state_target = self.Q_target(next_states)
+            #create slices
+            slices = tf.concat([batch_idxs, actions_optimal], axis=1)
+            #compute the target
+            y = rewards + self.gamma \
+                * tf.gather_nd(q_next_state_target, slices) * (1 - dones)
+            
+            #compute Q values for s
+            q_vals = self.Q_prime(states)
+            #update the appropriate entries of q_vals with the updates
+            q_update = q_vals
+            slices = tf.concat([batch_idxs, actions], axis=1)
+            q_update = tf.tensor_scatter_nd_update(q_vals, slices, y)
+            #compute the loss (mse)
+            q_loss = tf.math.reduce_mean(tf.math.square(q_vals - q_update))
+        
+        #compute the gradients
+        q_grad = tape.gradient(q_loss, self.Q_prime.trainable_variables)
+        #update the primary model
+        self.q_optimizer.apply_gradients(
+            zip(q_grad, self.Q_prime.trainable_variables)
+        )
         
         #update target network (low pass filter)
         self.update_target_network()
         
-        return loss
+        #update the learning rate of the optimizer
+        self.update_learning_rate()
+        
+        #update the number of training sessions
+        self.num_updates += 1
+        return q_loss.numpy()
 
     def get_epsilon(self):
         return self.epsilon
 
-    def train(self, env, batch_sz, updates):
+    def train(self, env, episodes):
         #training loop
         ep_rewards = []
         ep_losses = []
-        rewards = []
-        next_state = env.reset()
-        for update in range(updates):
-            for step in range(batch_sz):
+        total_timesteps = 0
+        for episode in range(episodes):
+            rewards = []
+            next_state = env.reset()
+            done = False
+            while not done:
                 state = next_state
                 action = self.get_action(next_state)
                 next_state, reward, done, _ = env.step(action)
                 self.remember(state, action, reward, next_state, done)
                 rewards.append(reward)
                 
-                self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
-
-                if done:
-                    ep_rewards.append(sum(rewards))
-                    rewards = []
-                    next_state = env.reset()
+                if(total_timesteps >= 500):
+                    #train
+                    ep_loss = self.train_network()
+                    ep_losses.append(ep_loss)
+                    #update epsilon (exploration)
+                    self.update_epsilon()
                     
-                    msg = "Episode: %03d, Reward: %03d, epsilon: %f, update: %03d"
-                    fmt = (len(ep_rewards)-1, ep_rewards[-1], self.epsilon, update)
-                    logging.info(msg % fmt)
-            
-            #sample the buffer and train the Qnetwork
-            ep_loss = self.train_network()
-            ep_losses.append(ep_loss)
-            
-            logging.debug("[%d/%d] value loss: %s" 
-                          % (update + 1, updates, ep_loss))
+                total_timesteps += 1
+                
+            ep_rewards.append(sum(rewards))
+            msg = "Episode: %03d, Reward: %03d, epsilon: %f, learning rate: %f"
+            fmt = (episode, ep_rewards[-1], self.epsilon, self.lr)
+            logging.info(msg % fmt)
+                
         return ep_rewards, ep_losses
  
     def test(self, env, render=False):
